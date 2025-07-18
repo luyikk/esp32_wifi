@@ -1,7 +1,12 @@
+mod led;
+
+use anyhow::Context;
+use aqueue::Actor;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::lazy_lock::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use embedded_svc::{
     http::{client::Client as HttpClient, Method},
@@ -11,15 +16,20 @@ use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 
 use embassy_time::Timer;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::gpio::{Gpio2, PinDriver};
 use esp_idf_svc::hal::peripherals::Peripherals;
 
+use crate::led::{ILed, Led};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{
     AsyncWifi, ClientConfiguration as WifiClientConfig, Configuration as WifiConfig, EspWifi,
 };
+use once_cell::sync::OnceCell;
 
 static CHANNEL: LazyLock<Channel<NoopRawMutex, u32, 1>> = LazyLock::new(|| Channel::new());
+static LED: OnceCell<Actor<Led<Gpio2>>> = OnceCell::new();
+static LED_CHECK: AtomicBool = AtomicBool::new(false);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -27,6 +37,7 @@ async fn main(spawner: Spawner) {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     spawner.spawn(connect_wifi()).unwrap();
+    spawner.spawn(led_check()).unwrap();
 
     log::info!("Hello, world!");
     loop {
@@ -39,7 +50,7 @@ async fn main(spawner: Spawner) {
             .unwrap(),
         );
         let headers = [("accept", "text/plain")];
-        let url = "https://www.google.com/";
+        let url = "https://www.baidu.com/";
         let request = client.request(Method::Get, url, &headers).unwrap();
         log::info!("-> GET {url}");
         let mut response = request.submit().unwrap();
@@ -65,12 +76,50 @@ async fn main(spawner: Spawner) {
 }
 
 #[embassy_executor::task]
+async fn led_check() {
+    async fn loop_loop() -> anyhow::Result<()> {
+        loop {
+            if LED.get().is_some() {
+                if LED_CHECK.load(Ordering::Acquire) {
+                    LED.get()
+                        .unwrap()
+                        .led2_on()
+                        .await
+                        .context("Failed to turn on LED")?;
+                } else {
+                    LED.get()
+                        .unwrap()
+                        .led2_off()
+                        .await
+                        .context("Failed to turn on LED")?;
+                    Timer::after(embassy_time::Duration::from_millis(500)).await;
+                    LED.get()
+                        .unwrap()
+                        .led2_on()
+                        .await
+                        .context("Failed to turn on LED")?;
+                }
+            }
+            Timer::after(embassy_time::Duration::from_millis(500)).await;
+        }
+    }
+    if let Err(err) = loop_loop().await {
+        log::error!("Error in led_check: {:?}", err);
+    }
+}
+
+#[embassy_executor::task]
 async fn connect_wifi() {
     async fn init_wifi() -> anyhow::Result<()> {
         let peripherals = Peripherals::take()?;
         let sys_loop = EspSystemEventLoop::take()?;
         let timer_service = EspTaskTimerService::new()?;
         let nvs = EspDefaultNvsPartition::take()?;
+
+        LED.set(Actor::new(Led::new(PinDriver::output(
+            peripherals.pins.gpio2,
+        )?)))
+        .map_err(|_| anyhow::anyhow!("Failed to set LED actor"))?;
 
         let mut wifi = AsyncWifi::wrap(
             EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
@@ -88,6 +137,12 @@ async fn connect_wifi() {
         wifi.start().await?;
         log::info!("Wifi started");
         loop {
+            LED.get()
+                .context("LED actor not initialized")?
+                .led2_off()
+                .await
+                .context("Failed to turn on LED")?;
+
             let aps = wifi.wifi_mut().scan()?;
             for ap in aps {
                 log::info!("可用 WiFi SSID: {}", ap.ssid);
@@ -113,10 +168,18 @@ async fn connect_wifi() {
 
             loop {
                 if let Ok(false) = wifi.wifi().is_connected() {
+                    LED.get()
+                        .context("LED actor not initialized")?
+                        .led2_off()
+                        .await
+                        .context("Failed to turn on LED")?;
+                    LED_CHECK.store(false, Ordering::Release);
                     log::warn!("WiFi disconnected, attempting to reconnect...");
                     break;
                 }
-                Timer::after(embassy_time::Duration::from_secs(5)).await;
+
+                LED_CHECK.store(true, Ordering::Release);
+                Timer::after(embassy_time::Duration::from_secs(1)).await;
             }
         }
     }
