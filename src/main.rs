@@ -19,13 +19,15 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::gpio::{Gpio2, PinDriver};
 use esp_idf_svc::hal::peripherals::Peripherals;
 
-use crate::led::{ILed, Led};
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{
     AsyncWifi, ClientConfiguration as WifiClientConfig, Configuration as WifiConfig, EspWifi,
 };
 use once_cell::sync::OnceCell;
+
+use crate::led::{ILed, Led};
 
 static CHANNEL: LazyLock<Channel<NoopRawMutex, u32, 1>> = LazyLock::new(|| Channel::new());
 static LED: OnceCell<Actor<Led<Gpio2>>> = OnceCell::new();
@@ -122,10 +124,24 @@ async fn connect_wifi() {
         .map_err(|_| anyhow::anyhow!("Failed to set LED actor"))?;
 
         let mut wifi = AsyncWifi::wrap(
-            EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+            EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?,
             sys_loop,
             timer_service,
         )?;
+
+        let mut ns = EspNvs::new(nvs, "config", true)?;
+        if !ns.contains("password")? {
+            ns.set_str("password", "a1234567890")?;
+        }
+
+        let len = ns
+            .str_len("password")?
+            .context("Failed to get password length from NVS")?;
+        let mut _r = vec![0u8; len];
+        let password = ns
+            .get_str("password", &mut _r)?
+            .context("Failed to get password from NVS")?;
+        log::info!("从 NVS 获取的密码: {password}");
 
         let ap_config = WifiConfig::Client(WifiClientConfig {
             ssid: "LY-TX".try_into().unwrap(),
