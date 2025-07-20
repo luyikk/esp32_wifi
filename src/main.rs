@@ -130,10 +130,22 @@ async fn connect_wifi() {
         )?;
 
         let mut ns = EspNvs::new(nvs, "config", true)?;
+
+        if !ns.contains("ssid")? {
+            ns.set_str("ssid", "LY-TX")?;
+        }
+        let len = ns
+            .str_len("ssid")?
+            .context("Failed to get password length from NVS")?;
+        let mut _r = vec![0u8; len];
+        let ssid = ns
+            .get_str("ssid", &mut _r)?
+            .context("Failed to get ssid from NVS")?;
+        log::info!("从 NVS 获取的ssid: {ssid}");
+
         if !ns.contains("password")? {
             ns.set_str("password", "a1234567890")?;
         }
-
         let len = ns
             .str_len("password")?
             .context("Failed to get password length from NVS")?;
@@ -144,8 +156,8 @@ async fn connect_wifi() {
         log::info!("从 NVS 获取的密码: {password}");
 
         let ap_config = WifiConfig::Client(WifiClientConfig {
-            ssid: "LY-TX".try_into().unwrap(),
-            password: "a1234567890".try_into().unwrap(),
+            ssid: ssid.try_into().unwrap(),
+            password: password.try_into().unwrap(),
             ..Default::default()
         });
 
